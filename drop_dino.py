@@ -207,7 +207,7 @@ def get_args_parser():
         "--global_crops_scale",
         type=float,
         nargs="+",
-        default=(0.4, 1.0),
+        default=(0.9, 0.9),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""",
@@ -224,7 +224,7 @@ def get_args_parser():
         "--local_crops_scale",
         type=float,
         nargs="+",
-        default=(0.05, 0.4),
+        default=(0.9, 0.9),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""",
     )
@@ -263,7 +263,7 @@ def get_args_parser():
         help="Please ignore and do not set this argument.",
     )
     parser.add_argument(
-        "--port", default="29500", type=str, help="port for distributed_mode."
+        "--port", default="29501", type=str, help="port for distributed_mode."
     )
     parser.add_argument(
         "--subset",
@@ -337,26 +337,18 @@ def train_dino(args):
         print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    # student = utils.MultiCropWrapper(
-    #     student,
-    #     DINOHead(
-    #         embed_dim,
-    #         args.out_dim,
-    #         use_bn=args.use_bn_in_head,
-    #         norm_last_layer=args.norm_last_layer,
-    #     ),
-    # )
-    # teacher = utils.MultiCropWrapper(
-    #     teacher,
-    #     DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
-    # )
     student = utils.MultiCropWrapper(
         student,
-        nn.Identity(),
+        DINOHead(
+            embed_dim,
+            args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=args.norm_last_layer,
+        ),
     )
     teacher = utils.MultiCropWrapper(
         teacher,
-        nn.Identity(),
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -406,43 +398,43 @@ def train_dino(args):
         fp16_scaler = torch.cuda.amp.GradScaler()
 
     # ============ init schedulers ... ============
-    lr_schedule = utils.cosine_scheduler(
-        args.lr
-        * (args.batch_size_per_gpu * utils.get_world_size())
-        / 256.0,  # linear scaling rule
-        args.min_lr,
-        args.epochs,
-        len(data_loader),
-        warmup_epochs=args.warmup_epochs,
-    )
-    wd_schedule = utils.cosine_scheduler(
-        args.weight_decay,
-        args.weight_decay_end,
-        args.epochs,
-        len(data_loader),
-    )
-    # momentum parameter is increased to 1. during training with a cosine schedule
-    momentum_schedule = utils.cosine_scheduler(
-        args.momentum_teacher, 1, args.epochs, len(data_loader)
-    )
-
     # lr_schedule = utils.cosine_scheduler(
-    #     args.lr,
-    #     args.lr,
+    #     args.lr
+    #     * (args.batch_size_per_gpu * utils.get_world_size())
+    #     / 256.0,  # linear scaling rule
+    #     args.min_lr,
     #     args.epochs,
     #     len(data_loader),
-    #     warmup_epochs=0,
+    #     warmup_epochs=args.warmup_epochs,
     # )
     # wd_schedule = utils.cosine_scheduler(
-    #     0,
-    #     0,
+    #     args.weight_decay,
+    #     args.weight_decay_end,
     #     args.epochs,
     #     len(data_loader),
     # )
     # # momentum parameter is increased to 1. during training with a cosine schedule
     # momentum_schedule = utils.cosine_scheduler(
-    #     args.momentum_teacher, args.momentum_teacher, args.epochs, len(data_loader)
+    #     args.momentum_teacher, 1, args.epochs, len(data_loader)
     # )
+
+    lr_schedule = utils.cosine_scheduler(
+        args.lr,
+        args.lr,
+        args.epochs,
+        len(data_loader),
+        warmup_epochs=0,
+    )
+    wd_schedule = utils.cosine_scheduler(
+        0,
+        0,
+        args.epochs,
+        len(data_loader),
+    )
+    # momentum parameter is increased to 1. during training with a cosine schedule
+    momentum_schedule = utils.cosine_scheduler(
+        args.momentum_teacher, args.momentum_teacher, args.epochs, len(data_loader)
+    )
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
@@ -682,8 +674,8 @@ class DataAugmentationDINO(object):
                 transforms.RandomResizedCrop(
                     224, scale=global_crops_scale, interpolation=Image.BICUBIC
                 ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(1.0),
+                # flip_and_color_jitter,
+                # utils.GaussianBlur(1.0),
                 normalize,
             ]
         )
@@ -693,9 +685,9 @@ class DataAugmentationDINO(object):
                 transforms.RandomResizedCrop(
                     224, scale=global_crops_scale, interpolation=Image.BICUBIC
                 ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(0.1),
-                utils.Solarization(0.2),
+                # flip_and_color_jitter,
+                # utils.GaussianBlur(0.1),
+                # utils.Solarization(0.2),
                 normalize,
             ]
         )
@@ -704,10 +696,10 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
+                    224, scale=local_crops_scale, interpolation=Image.BICUBIC
                 ),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=0.5),
+                # flip_and_color_jitter,
+                # utils.GaussianBlur(p=0.5),
                 normalize,
             ]
         )

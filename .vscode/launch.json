@@ -1,0 +1,41 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "drop_dino.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--arch",
+                "vit_tiny",
+                "--data_path",
+                "/mnt/raid/hli/datasets/imagenet/ilsvrc2012/train",
+                "--output_dir",
+                "/mnt/raid/hli/models/dino",
+                "--port",
+                "29501"
+            ]
+        },
+        {
+            "name": "Python: Module",
+            "type": "python",
+            "request": "launch",
+            "module": "main_dino",
+            "justMyCode": true,
+            "args": [
+                "--arch",
+                "vit_tiny",
+                "--data_path",
+                "/mnt/raid/hli/datasets/imagenet/ilsvrc2012/train",
+                "--output_dir",
+                "/mnt/raid/hli/models/dino"
+            ]
+        }
+    ]
+}

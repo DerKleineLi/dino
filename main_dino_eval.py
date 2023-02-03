@@ -265,12 +265,6 @@ def get_args_parser():
     parser.add_argument(
         "--port", default="29500", type=str, help="port for distributed_mode."
     )
-    parser.add_argument(
-        "--subset",
-        default=0,
-        type=int,
-        help="train with a subset with the sample number.",
-    )
     return parser
 
 
@@ -290,10 +284,6 @@ def train_dino(args):
         args.local_crops_number,
     )
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    if args.subset > 0:
-        np.random.seed(0)
-        ids = np.random.permutation(len(dataset))[: args.subset]
-        dataset = torch.utils.data.Subset(dataset, ids)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -337,26 +327,18 @@ def train_dino(args):
         print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    # student = utils.MultiCropWrapper(
-    #     student,
-    #     DINOHead(
-    #         embed_dim,
-    #         args.out_dim,
-    #         use_bn=args.use_bn_in_head,
-    #         norm_last_layer=args.norm_last_layer,
-    #     ),
-    # )
-    # teacher = utils.MultiCropWrapper(
-    #     teacher,
-    #     DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
-    # )
     student = utils.MultiCropWrapper(
         student,
-        nn.Identity(),
+        DINOHead(
+            embed_dim,
+            args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=args.norm_last_layer,
+        ),
     )
     teacher = utils.MultiCropWrapper(
         teacher,
-        nn.Identity(),
+        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -425,24 +407,6 @@ def train_dino(args):
     momentum_schedule = utils.cosine_scheduler(
         args.momentum_teacher, 1, args.epochs, len(data_loader)
     )
-
-    # lr_schedule = utils.cosine_scheduler(
-    #     args.lr,
-    #     args.lr,
-    #     args.epochs,
-    #     len(data_loader),
-    #     warmup_epochs=0,
-    # )
-    # wd_schedule = utils.cosine_scheduler(
-    #     0,
-    #     0,
-    #     args.epochs,
-    #     len(data_loader),
-    # )
-    # # momentum parameter is increased to 1. during training with a cosine schedule
-    # momentum_schedule = utils.cosine_scheduler(
-    #     args.momentum_teacher, args.momentum_teacher, args.epochs, len(data_loader)
-    # )
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
@@ -460,53 +424,27 @@ def train_dino(args):
 
     start_time = time.time()
     print("Starting DINO training !")
-    for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
+    data_loader.sampler.set_epoch(epoch)
 
-        # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(
-            student,
-            teacher,
-            teacher_without_ddp,
-            dino_loss,
-            data_loader,
-            optimizer,
-            lr_schedule,
-            wd_schedule,
-            momentum_schedule,
-            epoch,
-            fp16_scaler,
-            args,
-        )
-
-        # ============ writing logs ... ============
-        save_dict = {
-            "student": student.state_dict(),
-            "teacher": teacher.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch + 1,
-            "args": args,
-            "dino_loss": dino_loss.state_dict(),
-        }
-        if fp16_scaler is not None:
-            save_dict["fp16_scaler"] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth"))
-        if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(
-                save_dict, os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth")
-            )
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            "epoch": epoch,
-        }
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+    # ============ training one epoch of DINO ... ============
+    mean_loss = train_one_epoch(
+        student,
+        teacher,
+        teacher_without_ddp,
+        dino_loss,
+        data_loader,
+        optimizer,
+        lr_schedule,
+        wd_schedule,
+        momentum_schedule,
+        0,
+        fp16_scaler,
+        args,
+    )
+    print(mean_loss)
 
 
+@torch.no_grad()
 def train_one_epoch(
     student,
     teacher,
@@ -523,7 +461,10 @@ def train_one_epoch(
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    mean_loss = 0
+    student.eval()
+    teacher.eval()
+    for it, (images, _) in enumerate(tqdm(data_loader)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -540,48 +481,8 @@ def train_one_epoch(
             )  # only the 2 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
-
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
-            sys.exit(1)
-
-        # student update
-        optimizer.zero_grad()
-        param_norms = None
-        if fp16_scaler is None:
-            loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
-            optimizer.step()
-        else:
-            fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
-                fp16_scaler.unscale_(
-                    optimizer
-                )  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
-
-        # EMA update for the teacher
-        with torch.no_grad():
-            m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(
-                student.module.parameters(), teacher_without_ddp.parameters()
-            ):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-
-        # logging
-        torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+            mean_loss += loss / len(data_loader)
+    return mean_loss
 
 
 class DINOLoss(nn.Module):

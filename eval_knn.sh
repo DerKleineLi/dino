@@ -1,0 +1,2 @@
+python eval_knn.py --arch vit_small --data_path /mnt/raid/hli/datasets/imagenet/ilsvrc2012 --port 29503 --subset 50000 --pretrained_weights /mnt/raid/hli/models/dino/train_drop_no_aug/checkpoint.pth
+# --pretrained_weights /mnt/raid/hli/models/dino_v/checkpoint.pth

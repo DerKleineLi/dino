@@ -1,0 +1,1 @@
+python drop_dino.py --warmup_epochs 0 --arch vit_small --data_path /mnt/raid/hli/datasets/imagenet/ilsvrc2012/train --output_dir /mnt/raid/hli/models/dino/train_drop_no_aug --subset 1201 --batch_size_per_gpu 8 --epochs 1200 --lr 2.e-4

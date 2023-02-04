@@ -293,7 +293,7 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x), patch_emb, pos_emb
 
-    def forward(self, x, dropout_patches=False, debug=False):
+    def forward(self, x, dropout_patches=False, debug=False, segm=False):
         x, patch_emb, pos_emb = self.prepare_tokens(x)
         if dropout_patches:
             x = self.drop_patches(x)
@@ -304,6 +304,8 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
         if debug:
             return x, patch_emb, pos_emb, hidden_states
+        if segm:
+            return x[:, 1:]
         return x[:, 0]
 
     def drop_patches(self, x):

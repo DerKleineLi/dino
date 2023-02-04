@@ -1,1 +1,1 @@
-python -m torch.distributed.launch --nproc_per_node=1 main_dino.py --arch vit_small --data_path /mnt/raid/hli/datasets/imagenet/ilsvrc2012/train --output_dir /mnt/raid/hli/models/dino/train_no_head --subset 1201 --batch_size_per_gpu 8 --epochs 1200 --out_dim 384
+python -m torch.distributed.launch --nproc_per_node=1 main_dino.py --arch vit_small --data_path /mnt/raid/hli/datasets/imagenet/ilsvrc2012/train --output_dir /mnt/raid/hli/models/dino/train_no_wd --subset 1201 --batch_size_per_gpu 8 --epochs 1200

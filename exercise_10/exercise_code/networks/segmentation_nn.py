@@ -44,7 +44,9 @@ class SegmentationNN(nn.Module):
         #                             YOUR CODE                               #
         #######################################################################
 
-        x = self.backbone(x, segm=True)  # (B P 384)
+        x = self.backbone(x, class_token_only=False)  # (B P 384)
+        if isinstance(x, tuple):
+            x = x[0]
         B, P, D = x.shape
         x = x.view(B, 14, 14, D)
         x = rearrange(x, "b w h d -> b d w h")

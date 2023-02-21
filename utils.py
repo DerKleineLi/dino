@@ -696,7 +696,8 @@ class MultiCropWrapper(nn.Module):
         idx_crops = [2] if len(x) == 2 else [2, len(x)] if len(x) > 2 else [len(x)]
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx:end_idx]), start_idx != 0)
+            _out = self.backbone(torch.cat(x[start_idx:end_idx]))
+            # _out = self.backbone(torch.cat(x[start_idx:end_idx]), start_idx != 0)
             # The output is a tuple with XCiT model. See:
             # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
             if isinstance(_out, tuple):

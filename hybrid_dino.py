@@ -33,6 +33,16 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from vot.models.factory import (
+    create_model,
+    create_optimizer,
+    dino_load_checkpoint,
+    dino_save_checkpoint,
+)
+import yaml
+import MinkowskiEngine as ME
+from einops import rearrange
+from experiment.hybrid import Hybrid
 
 torchvision_archs = sorted(
     name
@@ -271,6 +281,12 @@ def get_args_parser():
         type=int,
         help="train with a subset with the sample number.",
     )
+    parser.add_argument(
+        "--config_file",
+        default="/home/hli/dl_ws/voxel-transformer/configs/2d_dino.yaml",
+        type=str,
+        help="""Path of the configuration file.""",
+    )
     return parser
 
 
@@ -336,6 +352,9 @@ def train_dino(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
+    student = Hybrid(student)
+    teacher = Hybrid(teacher)
+
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
         student,
@@ -358,6 +377,34 @@ def train_dino(args):
     #     teacher,
     #     nn.Identity(),
     # )
+
+    # # use vot model
+    # dino = student.backbone
+    # dino_head = student.head
+    # teacher_emb = teacher.backbone.patch_embed
+    # with open(args.config_file, "r") as file:
+    #     config = yaml.load(file, Loader=yaml.FullLoader)
+    # student = create_model(config["model"])
+    # teacher = create_model(config["model"])
+    # with torch.no_grad():
+    #     student.backbone.patch_embedding.head_conv.kernel[:] = rearrange(
+    #         dino.patch_embed.proj.weight, "p c w h -> (h w) c p"
+    #     )
+    #     student.backbone.patch_embedding.head_conv.bias[:] = dino.patch_embed.proj.bias
+
+    #     student.backbone.position_embedding.position_embedding[:] = dino.pos_embed[
+    #         0, 1:
+    #     ]
+    #     student.backbone.class_token.class_position_embedding[:] = dino.pos_embed[0, 0]
+    #     student.backbone.class_token.class_embedding[:] = dino.cls_token
+
+    #     student.backbone.encoder.blocks.load_state_dict(dino.blocks.state_dict())
+    #     student.backbone.encoder.encoder_norm.load_state_dict(dino.norm.state_dict())
+
+    #     student.head.load_state_dict(dino_head.state_dict())
+    #     student.backbone.patch_embedding = dino.patch_embed
+    #     teacher.backbone.patch_embedding = teacher_emb
+
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -366,12 +413,12 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -533,6 +580,7 @@ def train_one_epoch(
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
+        # images = [ME.to_sparse(im) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(

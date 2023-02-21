@@ -29,10 +29,18 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-
+import yaml
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from vot.models.factory import (
+    create_model,
+    create_optimizer,
+    dino_load_checkpoint,
+    dino_save_checkpoint,
+)
+from vot.models.dino import MultiCropWrapper
+import MinkowskiEngine as ME
 
 torchvision_archs = sorted(
     name
@@ -46,85 +54,11 @@ torchvision_archs = sorted(
 def get_args_parser():
     parser = argparse.ArgumentParser("DINO", add_help=False)
 
-    # Model parameters
-    parser.add_argument(
-        "--arch",
-        default="vit_small",
-        type=str,
-        choices=["vit_tiny", "vit_small", "vit_base", "xcit", "deit_tiny", "deit_small"]
-        + torchvision_archs
-        + torch.hub.list("facebookresearch/xcit:main"),
-        help="""Name of architecture to train. For quick experiments with ViTs,
-        we recommend using vit_tiny or vit_small.""",
-    )
-    parser.add_argument(
-        "--patch_size",
-        default=16,
-        type=int,
-        help="""Size in pixels
-        of input square patches - default 16 (for 16x16 patches). Using smaller
-        values leads to better performance but requires more memory. Applies only
-        for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
-        mixed precision training (--use_fp16 false) to avoid unstabilities.""",
-    )
-    parser.add_argument(
-        "--out_dim",
-        default=65536,
-        type=int,
-        help="""Dimensionality of
-        the DINO head output. For complex and large datasets large values (like 65k) work well.""",
-    )
-    parser.add_argument(
-        "--norm_last_layer",
-        default=True,
-        type=utils.bool_flag,
-        help="""Whether or not to weight normalize the last layer of the DINO head.
-        Not normalizing leads to better performance but can make the training unstable.
-        In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""",
-    )
-    parser.add_argument(
-        "--momentum_teacher",
-        default=0.996,
-        type=float,
-        help="""Base EMA
-        parameter for teacher update. The value is increased to 1 during training with cosine schedule.
-        We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""",
-    )
-    parser.add_argument(
-        "--use_bn_in_head",
-        default=False,
-        type=utils.bool_flag,
-        help="Whether to use batch normalizations in projection head (Default: False)",
-    )
-
-    # Temperature teacher parameters
-    parser.add_argument(
-        "--warmup_teacher_temp",
-        default=0.04,
-        type=float,
-        help="""Initial value for the teacher temperature: 0.04 works well in most cases.
-        Try decreasing it if the training loss does not decrease.""",
-    )
-    parser.add_argument(
-        "--teacher_temp",
-        default=0.04,
-        type=float,
-        help="""Final value (after linear warmup)
-        of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
-        starting with the default value of 0.04 and increase this slightly if needed.""",
-    )
-    parser.add_argument(
-        "--warmup_teacher_temp_epochs",
-        default=0,
-        type=int,
-        help="Number of warmup epochs for the teacher temperature (Default: 30).",
-    )
-
     # Training/Optimization parameters
     parser.add_argument(
         "--use_fp16",
         type=utils.bool_flag,
-        default=True,
+        default=False,
         help="""Whether or not
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
@@ -148,7 +82,7 @@ def get_args_parser():
     parser.add_argument(
         "--clip_grad",
         type=float,
-        default=3.0,
+        default=0.0,
         help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""",
@@ -163,8 +97,8 @@ def get_args_parser():
         "--epochs", default=100, type=int, help="Number of epochs of training."
     )
     parser.add_argument(
-        "--freeze_last_layer",
-        default=1,
+        "--freeze_last_layer",  # NOTE
+        default=0,
         type=int,
         help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -199,7 +133,15 @@ def get_args_parser():
         help="""Type of optimizer. We recommend using adamw with ViTs.""",
     )
     parser.add_argument(
-        "--drop_path_rate", type=float, default=0.1, help="stochastic depth rate"
+        "--drop_path_rate", type=float, default=0.0, help="stochastic depth rate"
+    )
+    parser.add_argument(
+        "--momentum_teacher",
+        default=0.996,
+        type=float,
+        help="""Base EMA
+        parameter for teacher update. The value is increased to 1 during training with cosine schedule.
+        We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""",
     )
 
     # Multi-crop parameters
@@ -271,6 +213,21 @@ def get_args_parser():
         type=int,
         help="train with a subset with the sample number.",
     )
+
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        type=str,
+        choices=["cuda", "cpu"],
+        help="""Device to use for training.""",
+    )
+    parser.add_argument(
+        "--config_file",
+        default="/home/hli/dl_ws/voxel-transformer/configs/2d_dino.yaml",
+        type=str,
+        help="""Path of the configuration file.""",
+    )
+
     return parser
 
 
@@ -307,57 +264,15 @@ def train_dino(args):
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
-    args.arch = args.arch.replace("deit", "vit")
-    # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
-        student = vits.__dict__[args.arch](
-            patch_size=args.patch_size,
-            drop_path_rate=args.drop_path_rate,  # stochastic depth # NOTE
-        )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
-        embed_dim = student.embed_dim
-    # if the network is a XCiT
-    elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
-        student = torch.hub.load(
-            "facebookresearch/xcit:main",
-            args.arch,
-            pretrained=False,
-            drop_path_rate=args.drop_path_rate,
-        )
-        teacher = torch.hub.load(
-            "facebookresearch/xcit:main", args.arch, pretrained=False
-        )
-        embed_dim = student.embed_dim
-    # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
-    else:
-        print(f"Unknow architecture: {args.arch}")
+    with open(args.config_file, "r") as file:
+        config = yaml.load(file, Loader=yaml.FullLoader)
+    student = create_model(config["model"]).to(args.device)
+    teacher = create_model(config["model"]).to(args.device)
+    # optimizer
+    optimizer = create_optimizer(student.parameters(), config["optimizer"])
+    # loss
+    dino_loss = create_model(config["loss"]).to(args.device)
 
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(
-        student,
-        DINOHead(
-            embed_dim,
-            args.out_dim,
-            use_bn=args.use_bn_in_head,
-            norm_last_layer=args.norm_last_layer,
-        ),
-    )
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
-    )
-    # student = utils.MultiCropWrapper(
-    #     student,
-    #     nn.Identity(),
-    # )
-    # teacher = utils.MultiCropWrapper(
-    #     teacher,
-    #     nn.Identity(),
-    # )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -371,35 +286,25 @@ def train_dino(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
+
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
-    # teacher and student start with the same weights
+    # NOTE: teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    print(f"Student and Teacher are built: they are both VOT network.")
 
-    # ============ preparing loss ... ============
-    dino_loss = DINOLoss(
-        args.out_dim,
-        args.local_crops_number
-        + 2,  # total number of crops = 2 global crops + local_crops_number
-        args.warmup_teacher_temp,
-        args.teacher_temp,
-        args.warmup_teacher_temp_epochs,
-        args.epochs,
-    ).cuda()
-
-    # ============ preparing optimizer ... ============
-    params_groups = utils.get_params_groups(student)  # NOTE
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-    elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(
-            params_groups, lr=0, momentum=0.9
-        )  # lr is set by scheduler
-    elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+    # # ============ preparing optimizer ... ============
+    # params_groups = utils.get_params_groups(student)
+    # if args.optimizer == "adamw":
+    #     optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+    # elif args.optimizer == "sgd":
+    #     optimizer = torch.optim.SGD(
+    #         params_groups, lr=0, momentum=0.9
+    #     )  # lr is set by scheduler
+    # elif args.optimizer == "lars":
+    #     optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
@@ -421,9 +326,9 @@ def train_dino(args):
     #     args.epochs,
     #     len(data_loader),
     # )
-    # momentum parameter is increased to 1. during training with a cosine schedule
+    # # momentum parameter is increased to 1. during training with a cosine schedule
     # momentum_schedule = utils.cosine_scheduler(
-    #     args.momentum_teacher, 1, args.epochs, len(data_loader)
+    #     config["momentum_teacher"], 1, args.epochs, len(data_loader)
     # )
 
     lr_schedule = utils.cosine_scheduler(
@@ -447,15 +352,15 @@ def train_dino(args):
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth"),
+    #     run_variables=to_restore,
+    #     student=student,
+    #     teacher=teacher,
+    #     optimizer=optimizer,
+    #     fp16_scaler=fp16_scaler,
+    #     dino_loss=dino_loss,
+    # )
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
@@ -526,19 +431,20 @@ def train_one_epoch(
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
+        # for i, param_group in enumerate(optimizer.param_groups):
+        #     param_group["lr"] = lr_schedule[it]
+        #     if i == 0:  # only the first group is regularized
+        #         param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
+        sinputs = [ME.to_sparse(im) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(
-                images[:2]
+                sinputs[:2]
             )  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            student_output = student(sinputs)
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
@@ -551,10 +457,8 @@ def train_one_epoch(
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)  # NOTE
-            utils.cancel_gradients_last_layer(
-                epoch, student, args.freeze_last_layer
-            )  # NOTE
+                param_norms = utils.clip_gradients(student, args.clip_grad)
+            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
@@ -706,7 +610,7 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    224, scale=local_crops_scale, interpolation=Image.BICUBIC
+                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(p=0.5),

@@ -41,6 +41,7 @@ from vot.models.factory import (
 )
 from vot.models.dino import MultiCropWrapper
 import MinkowskiEngine as ME
+from einops import rearrange
 
 torchvision_archs = sorted(
     name
@@ -134,6 +135,14 @@ def get_args_parser():
     )
     parser.add_argument(
         "--drop_path_rate", type=float, default=0.1, help="stochastic depth rate"
+    )
+    parser.add_argument(
+        "--momentum_teacher",
+        default=0.996,
+        type=float,
+        help="""Base EMA
+        parameter for teacher update. The value is increased to 1 during training with cosine schedule.
+        We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""",
     )
 
     # Multi-crop parameters
@@ -255,22 +264,56 @@ def train_dino(args):
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
+    # # we changed the name DeiT-S for ViT-S to avoid confusions
+    # args.arch = args.arch.replace("deit", "vit")
+    # # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
+    # if args.arch in vits.__dict__.keys():
+    #     dino = vits.__dict__[args.arch](patch_size=args.patch_size)
+    #     embed_dim = dino.embed_dim
+    # else:
+    #     print(f"Unknow architecture: {args.arch}")
+
+    # # multi-crop wrapper handles forward with inputs of different resolutions
+    # dino_head = DINOHead(embed_dim, args.out_dim, args.use_bn_in_head)
+
     # we changed the name DeiT-S for ViT-S to avoid confusions
     with open(args.config_file, "r") as file:
         config = yaml.load(file, Loader=yaml.FullLoader)
     student = create_model(config["model"]).to(args.device)
     teacher = create_model(config["model"]).to(args.device)
-    student_head = create_model(config["student_head"]).to(args.device)
-    teacher_head = create_model(config["teacher_head"]).to(args.device)
+
+    # with torch.no_grad():
+    #     student.backbone.patch_embedding.head_conv.kernel[:] = rearrange(
+    #         dino.patch_embed.proj.weight, "p c w h -> (h w) c p"
+    #     )
+    #     student.backbone.patch_embedding.head_conv.bias[:] = dino.patch_embed.proj.bias
+
+    #     student.backbone.position_embedding.position_embedding[:] = dino.pos_embed[
+    #         0, 1:
+    #     ]
+    #     student.backbone.class_token.class_position_embedding[:] = dino.pos_embed[0, 0]
+    #     student.backbone.class_token.class_embedding[:] = dino.cls_token
+
+    #     student.backbone.encoder.blocks.load_state_dict(dino.blocks.state_dict())
+    #     student.backbone.encoder.encoder_norm.load_state_dict(dino.norm.state_dict())
+
+    #     student.head.load_state_dict(dino_head.state_dict())
+
     # optimizer
     # optimizer = create_optimizer(
     #     list(student.parameters()) + list(student_head.parameters()),
     #     config["optimizer"],
     # )
     # loss
-    student = MultiCropWrapper(student, student_head)
-    teacher = MultiCropWrapper(teacher, teacher_head)
-    dino_loss = create_model(config["loss"]).to(args.device)
+    # dino_loss = create_model(config["loss"]).to(args.device)
+    dino_loss = DINOLoss(
+        65536,
+        10,
+        0.04,
+        0.04,
+        0,
+        args.epochs,
+    ).cuda()
 
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
@@ -310,56 +353,56 @@ def train_dino(args):
         fp16_scaler = torch.cuda.amp.GradScaler()
 
     # ============ init schedulers ... ============
-    lr_schedule = utils.cosine_scheduler(
-        args.lr
-        * (args.batch_size_per_gpu * utils.get_world_size())
-        / 256.0,  # linear scaling rule
-        args.min_lr,
-        args.epochs,
-        len(data_loader),
-        warmup_epochs=args.warmup_epochs,
-    )
-    wd_schedule = utils.cosine_scheduler(
-        args.weight_decay,
-        args.weight_decay_end,
-        args.epochs,
-        len(data_loader),
-    )
-    # momentum parameter is increased to 1. during training with a cosine schedule
-    momentum_schedule = utils.cosine_scheduler(
-        config["momentum_teacher"], 1, args.epochs, len(data_loader)
-    )
-
     # lr_schedule = utils.cosine_scheduler(
-    #     args.lr,
-    #     args.lr,
+    #     args.lr
+    #     * (args.batch_size_per_gpu * utils.get_world_size())
+    #     / 256.0,  # linear scaling rule
+    #     args.min_lr,
     #     args.epochs,
     #     len(data_loader),
-    #     warmup_epochs=0,
+    #     warmup_epochs=args.warmup_epochs,
     # )
     # wd_schedule = utils.cosine_scheduler(
-    #     0,
-    #     0,
+    #     args.weight_decay,
+    #     args.weight_decay_end,
     #     args.epochs,
     #     len(data_loader),
     # )
     # # momentum parameter is increased to 1. during training with a cosine schedule
     # momentum_schedule = utils.cosine_scheduler(
-    #     args.momentum_teacher, args.momentum_teacher, args.epochs, len(data_loader)
+    #     config["momentum_teacher"], 1, args.epochs, len(data_loader)
     # )
+
+    lr_schedule = utils.cosine_scheduler(
+        args.lr,
+        args.lr,
+        args.epochs,
+        len(data_loader),
+        warmup_epochs=0,
+    )
+    wd_schedule = utils.cosine_scheduler(
+        0,
+        0,
+        args.epochs,
+        len(data_loader),
+    )
+    # momentum parameter is increased to 1. during training with a cosine schedule
+    momentum_schedule = utils.cosine_scheduler(
+        args.momentum_teacher, args.momentum_teacher, args.epochs, len(data_loader)
+    )
     print(f"Loss, optimizer and schedulers ready.")
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
-    # utils.restart_from_checkpoint(
-    #     os.path.join(args.output_dir, "checkpoint.pth"),
-    #     run_variables=to_restore,
-    #     student=student,
-    #     teacher=teacher,
-    #     optimizer=optimizer,
-    #     fp16_scaler=fp16_scaler,
-    #     dino_loss=dino_loss,
-    # )
+    utils.restart_from_checkpoint(
+        os.path.join(args.output_dir, "checkpoint.pth"),
+        run_variables=to_restore,
+        student=student,
+        teacher=teacher,
+        optimizer=optimizer,
+        fp16_scaler=fp16_scaler,
+        dino_loss=dino_loss,
+    )
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
@@ -609,7 +652,7 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
+                    224, scale=local_crops_scale, interpolation=Image.BICUBIC
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(p=0.5),
